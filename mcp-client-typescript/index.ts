@@ -1,29 +1,26 @@
-import { Anthropic } from "@anthropic-ai/sdk";
-import {
-  MessageParam,
-  Tool,
-} from "@anthropic-ai/sdk/resources/messages/messages.mjs";
+import { OpenRouter } from "@openrouter/sdk";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import readline from "readline/promises";
 import dotenv from "dotenv";
+import { Message, ToolDefinitionJson } from "@openrouter/sdk/models";
 
 dotenv.config();
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-if (!ANTHROPIC_API_KEY) {
-  throw new Error("ANTHROPIC_API_KEY is not set");
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+if (!OPENROUTER_API_KEY) {
+  throw new Error("OPENROUTER_API_KEY is not set");
 }
 
 class McpClient {
   private mcp: Client;
-  private anthropic: Anthropic;
+  private openRouter: OpenRouter;
   private transport: StdioClientTransport | null = null;
-  private tools: Tool[] = [];
+  private tools: ToolDefinitionJson[] = [];
 
   constructor() {
-    this.anthropic = new Anthropic({
-      apiKey: ANTHROPIC_API_KEY,
+    this.openRouter = new OpenRouter({
+      apiKey: OPENROUTER_API_KEY,
     });
 
     this.mcp = new Client({ name: "mcp-client-cli", version: "1.0.0" });
@@ -54,15 +51,18 @@ class McpClient {
 
       this.tools = toolsResult.tools.map((tool) => {
         return {
-          name: tool.name,
-          description: tool.description,
-          input_schema: tool.inputSchema,
+          type: "function",
+          function: {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.inputSchema,
+          },
         };
       });
 
       console.log(
         "Connected to server with tools:",
-        this.tools.map(({ name }) => name)
+        this.tools.map((tool) => tool.function.name)
       );
     } catch (e) {
       console.log("Failed to connect to MCP server: ", e);
@@ -71,53 +71,164 @@ class McpClient {
   }
 
   async processQuery(query: string) {
-    const messages: MessageParam[] = [
+    // Create a system prompt that describes available tools
+    const toolDescriptions = this.tools
+      .map(
+        (tool) =>
+          `- ${tool.function.name}: ${
+            tool.function.description
+          }\n  Parameters: ${JSON.stringify(tool.function.parameters, null, 2)}`
+      )
+      .join("\n");
+
+    const systemPrompt = `You are an AI assistant with access to the following tools:
+
+${toolDescriptions}
+
+To use a tool, respond with a JSON object in this exact format:
+{
+  "tool_call": {
+    "name": "tool_name",
+    "arguments": {"param1": "value1", "param2": "value2"}
+  }
+}
+
+If you don't need to use any tools, just respond normally. Only use tools when specifically needed to answer the user's question.`;
+
+    const messages: Message[] = [
+      {
+        role: "system",
+        content: systemPrompt,
+      },
       {
         role: "user",
         content: query,
       },
     ];
 
-    const response = await this.anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
+    const response = await this.openRouter.chat.send({
+      model: "meta-llama/llama-3.2-3b-instruct:free",
       messages,
-      tools: this.tools,
+      maxTokens: 1000,
+      stream: false,
     });
 
     const finalText = [];
+    const message = response.choices[0].message;
+    let content = "";
 
-    for (const content of response.content) {
-      if (content.type === "text") {
-        finalText.push(content.text);
-      } else if (content.type === "tool_use") {
-        const toolName = content.name;
-        const toolArgs = content.input as { [x: string]: unknown } | undefined;
+    // Handle different content types
+    if (typeof message.content === "string") {
+      content = message.content;
+    } else if (Array.isArray(message.content)) {
+      // Extract text from content array
+      content = message.content
+        .filter((item: any) => item.type === "text")
+        .map((item: any) => item.text)
+        .join("");
+    }
 
+    // Check if the response contains a tool call - improved regex to handle nested objects
+    const toolCallMatch = content.match(
+      /\{\s*"tool_call"\s*:\s*\{[^{}]*\{[^}]*\}[^}]*\}\s*\}/
+    );
+
+    if (toolCallMatch) {
+      try {
+        // Extract just the JSON part and clean it
+        let jsonString = toolCallMatch[0];
+
+        // Try to find a more complete JSON if the regex didn't capture it fully
+        const startIndex = content.indexOf('{"tool_call"');
+        if (startIndex !== -1) {
+          let braceCount = 0;
+          let endIndex = startIndex;
+
+          for (let i = startIndex; i < content.length; i++) {
+            if (content[i] === "{") braceCount++;
+            if (content[i] === "}") braceCount--;
+            if (braceCount === 0) {
+              endIndex = i;
+              break;
+            }
+          }
+
+          if (endIndex > startIndex) {
+            jsonString = content.substring(startIndex, endIndex + 1);
+          }
+        }
+
+        console.log("Attempting to parse JSON:", jsonString);
+        const toolCallData = JSON.parse(jsonString);
+        const toolName = toolCallData.tool_call.name;
+        const toolArgs = toolCallData.tool_call.arguments;
+
+        // Convert string arguments to proper types if needed
+        const processedArgs: any = {};
+        for (const [key, value] of Object.entries(toolArgs)) {
+          if (typeof value === "string" && !isNaN(Number(value))) {
+            processedArgs[key] = Number(value);
+          } else {
+            processedArgs[key] = value;
+          }
+        }
+
+        // Execute the tool
         const result = await this.mcp.callTool({
           name: toolName,
-          arguments: toolArgs,
+          arguments: processedArgs,
         });
 
         finalText.push(
-          `[Calling tool ${toolName}] with args ${JSON.stringify(toolArgs)}`
+          `[Calling tool ${toolName}] with args ${JSON.stringify(
+            processedArgs
+          )}`
         );
+
+        // Get follow-up response with tool result
+        messages.push({
+          role: "assistant",
+          content: content,
+        });
 
         messages.push({
           role: "user",
-          content: result.content as string,
+          content: `Tool result: ${JSON.stringify(
+            result.content
+          )}. Please provide a final response based on this information.`,
         });
 
-        const response = await this.anthropic.messages.create({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 1000,
+        const followUpResponse = await this.openRouter.chat.send({
+          model: "meta-llama/llama-3.2-3b-instruct:free",
           messages,
+          maxTokens: 1000,
+          stream: false,
         });
 
-        finalText.push(
-          response.content[0].type === "text" ? response.content[0].text : ""
-        );
+        const followUpMessage = followUpResponse.choices[0].message;
+        let followUpContent = "";
+
+        if (typeof followUpMessage.content === "string") {
+          followUpContent = followUpMessage.content;
+        } else if (Array.isArray(followUpMessage.content)) {
+          followUpContent = followUpMessage.content
+            .filter((item: any) => item.type === "text")
+            .map((item: any) => item.text)
+            .join("");
+        }
+
+        if (followUpContent) {
+          finalText.push(followUpContent);
+        }
+      } catch (error) {
+        console.error("Full content:", content);
+        console.error("Matched JSON:", toolCallMatch[0]);
+        finalText.push("Error parsing tool call: " + error);
+        finalText.push(content);
       }
+    } else {
+      // No tool call, just return the response
+      finalText.push(content);
     }
 
     return finalText.join("\n");
